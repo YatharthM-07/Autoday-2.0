@@ -14,10 +14,20 @@ import UIKit
 /// Points per minute on the timeline  (hourHeight = 70 → 70/60 ≈ 1.167 pt/min)
 let kPPM: CGFloat = Theme.hourHeight / 60
 let kSnapMinutes: Int = 15
-let kTimelineStart: Int = 7   // 07:00
-let kTimelineEnd:   Int = 23  // 23:00
-let kTimelineStartMinutes: Int = kTimelineStart * 60
-let kTimelineEndMinutes:   Int = kTimelineEnd   * 60
+
+/// The day window comes from the profile (My day starts / My day ends).
+/// Falls back to 07:00 to 23:00 if nothing valid is stored.
+private var kDayWindow: (start: Int, end: Int) {
+    let d = UserDefaults.standard
+    let s = d.object(forKey: ProfileKeys.dayStart) as? Int ?? ProfileDefaults.dayStart
+    let e = d.object(forKey: ProfileKeys.dayEnd)   as? Int ?? ProfileDefaults.dayEnd
+    let valid = (0...23).contains(s) && (0...23).contains(e) && e - s >= ProfileDefaults.minWindow
+    return valid ? (s, e) : (ProfileDefaults.dayStart, ProfileDefaults.dayEnd)
+}
+var kTimelineStart: Int { kDayWindow.start }
+var kTimelineEnd:   Int { kDayWindow.end }
+var kTimelineStartMinutes: Int { kTimelineStart * 60 }
+var kTimelineEndMinutes:   Int { kTimelineEnd   * 60 }
 
 /// Named coordinate space attached to the (stationary) timeline ScrollView.
 let kTimelineSpace = "timelineScroll"

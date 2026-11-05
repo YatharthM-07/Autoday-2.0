@@ -5,10 +5,68 @@
 //  Created by Archita Saxena on 21/10/26.
 //
 //  tile's Swipe-to-done and snooze will land here.
+//  Also: side-by-side lane layout for overlapping tasks.
 
 
 import SwiftUI
 import UIKit
+
+// MARK: - Overlap lanes
+
+/// Which column a tile sits in when tasks overlap in time.
+struct TaskLane: Equatable {
+    var index: Int = 0
+    var count: Int = 1
+}
+
+/// x offset and width of a lane, in the timeline's coordinate space.
+/// `totalWidth` is the full width of the timeline (same width the old padding was applied to).
+func laneGeometry(_ lane: TaskLane, totalWidth: CGFloat) -> (x: CGFloat, width: CGFloat) {
+    let left: CGFloat  = Theme.labelWidth + 24
+    let right: CGFloat = 16
+    let gap: CGFloat   = 8
+    let n     = CGFloat(max(lane.count, 1))
+    let avail = max(totalWidth - left - right, 0)
+    let w     = max((avail - gap * (n - 1)) / n, 0)
+    return (left + CGFloat(lane.index) * (w + gap), w)
+}
+
+/// Groups overlapping tasks into clusters; inside a cluster each task gets a lane,
+/// and every task in the cluster shares the cluster's lane count.
+func computeTaskLanes(_ tasks: [TimelineTask]) -> [UUID: TaskLane] {
+    let eps = 0.0001
+    var result: [UUID: TaskLane] = [:]
+    var cluster: [UUID] = []
+    var laneEnds: [Double] = []
+    var clusterEnd = -Double.infinity
+
+    func flush() {
+        for id in cluster { result[id]?.count = laneEnds.count }
+        cluster = []
+        laneEnds = []
+    }
+
+    let sorted = tasks.sorted { ($0.startHour, $0.endHour) < ($1.startHour, $1.endHour) }
+    for t in sorted {
+        if t.startHour >= clusterEnd - eps {      // no overlap with the running cluster
+            flush()
+            clusterEnd = -Double.infinity
+        }
+        let idx: Int
+        if let i = laneEnds.firstIndex(where: { $0 <= t.startHour + eps }) {
+            laneEnds[i] = t.endHour
+            idx = i
+        } else {
+            laneEnds.append(t.endHour)
+            idx = laneEnds.count - 1
+        }
+        result[t.id] = TaskLane(index: idx, count: 1)
+        cluster.append(t.id)
+        clusterEnd = max(clusterEnd, t.endHour)
+    }
+    flush()
+    return result
+}
 
 // MARK: - Draggable Task Block wrapper
 
@@ -32,6 +90,7 @@ struct DraggableTaskBlock: View {
     
     var isMissed: Bool = false                                  //NEW not in zip.
     var isShaking: Bool = false                                 //NEW not in zip.
+    var lane: TaskLane = TaskLane()                             // overlap column
     
     // Swipe state
     @State private var swipeX: CGFloat = 0
@@ -45,13 +104,15 @@ struct DraggableTaskBlock: View {
 
     var body: some View {
         TaskBlockView(task: task, swipeOffset: swipeX, swipeThreshold: swipeThreshold,
-                      isMissed: isMissed, isShaking: isShaking)     //NEW not in zip.
+                      isMissed: isMissed, isShaking: isShaking,
+                      isRescheduling: isBeingDragged,               //NEW not in zip.
+                      lane: lane)
             .opacity(isOffDay || isSettling ? 0 : (isBeingDragged ? 0.35 : (isDimmed ? 0.55 : 1.0)))
             .animation(.easeOut(duration: 0.2), value: isDimmed)
             .animation(.spring(response: 0.25), value: isBeingDragged)
-            .gesture(holdAndDrag)
+            .simultaneousGesture(holdAndDrag)                       //NEW not in zip. (was .gesture: it blocked scrolling)
             .simultaneousGesture(swipe)
-            .simultaneousGesture(                      // ← add this
+            .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
                     guard !isBeingDragged, !isHolding else { return }
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -142,6 +203,8 @@ struct TaskBlockView: View {
     
     var isMissed: Bool = false                                  //NEW not in zip.
     var isShaking: Bool = false                                 //NEW not in zip.
+    var isRescheduling: Bool = false                            //NEW not in zip.
+    var lane: TaskLane = TaskLane()
 
     var body: some View {
         let top     = topOffsetForHour(task.startHour)
@@ -149,17 +212,20 @@ struct TaskBlockView: View {
         let compact = height < 50
         let time    = "\(hm(task.startHour)) – \(hm(task.endHour))"
 
-        ZStack {
-            if swipeOffset != 0 { swipeBackground }
+        GeometryReader { geo in
+            let g = laneGeometry(lane, totalWidth: geo.size.width)
+            ZStack {
+                if swipeOffset != 0 { swipeBackground }
 
-            tile(compact: compact, height: height, time: time)
-                .modifier(ShakeEffect(progress: isShaking ? 1 : 0))     //NEW not in zip.
-                .animation(isShaking ? .linear(duration: 0.55) : nil, value: isShaking) //NEW not in zip.
-                .offset(x: swipeOffset)
+                tile(compact: compact, height: height, time: time)
+                    .modifier(ShakeEffect(progress: isShaking ? 1 : 0))     //NEW not in zip.
+                    .animation(isShaking ? .linear(duration: 0.55) : nil, value: isShaking) //NEW not in zip.
+                    .offset(x: swipeOffset)
+            }
+            .frame(width: g.width, height: height)
+            .offset(x: g.x)
         }
         .frame(height: height)
-        .padding(.leading, Theme.labelWidth + 24)
-        .padding(.trailing, 16)
         .offset(y: top)
     }
 
@@ -168,10 +234,8 @@ struct TaskBlockView: View {
     private func tile(compact: Bool, height: CGFloat, time: String) -> some View {
         let dim: Double = task.isDone ? 0.55 : 1.0
 
-        let accent = task.isDone ? TaskStatusStyle.done.accent
-                   : (isMissed ? TaskStatusStyle.missed.accent : task.color.text) //NEW not in zip.
-        let fill   = task.isDone ? TaskStatusStyle.done.fill
-                   : (isMissed ? TaskStatusStyle.missed.fill : task.color.fill)   //NEW not in zip.
+        let accent = palette.accent
+        let fill   = palette.fill
         
         return Group {
             if compact {
@@ -202,25 +266,33 @@ struct TaskBlockView: View {
                     Text(time)
                         .font(.system(size: 12))
                         .opacity(0.7 * dim)
+                        .lineLimit(1)
                 }
             }
         }
-        //.foregroundStyle(task.color.text)
         .foregroundStyle(accent)//NEW not in zip.
         .padding(.leading, 22)
         .padding(.trailing, 14)
         .padding(.vertical, compact ? 0 : 10)
         .frame(maxWidth: .infinity, alignment: compact ? .leading : .topLeading)
         .frame(height: height)
-        //.background(task.color.fill)
         .background(fill) //NEW not in zip.
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 3, style: .continuous)
-                //.fill(task.color.text)
                 .fill(accent) //NEW not in zip.
                 .frame(width: 6.5)
         }
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    // MARK: Status colours
+
+    /// done -> missed -> rescheduled (a missed task that was placed again) -> normal.
+    private var palette: (accent: Color, fill: Color) {
+        if task.isDone        { return (TaskStatusStyle.done.accent, TaskStatusStyle.done.fill) }
+        if isMissed           { return (TaskStatusStyle.missed.accent, TaskStatusStyle.missed.fill) }
+        if task.isRescheduled { return (TaskStatusStyle.rescheduled.accent, TaskStatusStyle.rescheduled.fill) }
+        return (task.color.text, task.color.fill)
     }
 
     // MARK: Swipe reveal (sits behind the tile)
@@ -266,6 +338,11 @@ struct TaskBlockView: View {
                 .font(.system(size: 11, weight: .bold))
                 .foregroundStyle(TaskStatusStyle.missed.accent)
             }//NEW not in zip.
+            if task.isRescheduled && !task.isDone && !isMissed {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(TaskStatusStyle.rescheduled.accent)
+            }
             if task.isPinned { lockBadge(color: task.color.text) }
         }
     }
