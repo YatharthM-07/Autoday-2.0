@@ -39,6 +39,7 @@ struct TimelineTask: Identifiable {
     var rowKey:      String? = nil     // TaskSchedule id ("<task>#<chunk>")
     var isMissedRow: Bool    = false   // backend flagged this slot as missed
     var isChunk:     Bool    = false   // one piece of a split task
+    var isRescheduled: Bool  = false   // task was missed and has since been re-placed (yellow tile)
 
     var durationHours: Double { endHour - startHour }
 }
@@ -47,6 +48,8 @@ struct RescheduleTask: Identifiable {
     let id: UUID
     let title: String
     let scheduledTime: String
+    var durationMinutes: Int = 60          //NEW not in zip. (sizes the tile in the Tasks sheet)
+    var color: PastelColor = PastelColor.allCases[0]   //NEW not in zip. (slot placeholders while dragging it out)
 }
 
 struct UnscheduledTask: Identifiable {
@@ -54,6 +57,7 @@ struct UnscheduledTask: Identifiable {
     let title: String
     let color: PastelColor
     var durationMinutes: Int = 60
+    var isSplittable: Bool = false
 }
 
 struct DeletedTask {
@@ -72,6 +76,8 @@ final class TimelineStore: ObservableObject {
 
     // Scheduling alerts (see ScheduleFeedback.swift)
     @Published var toast: ScheduleToast? = nil
+    /// Set by Undo so the timeline can jump back to the task's original day.   //NEW not in zip.
+    @Published var focusDate: Date? = nil
     @Published var warning: ScheduleWarningBanner? = nil
     @Published var dialog: ScheduleDialog? = nil
     private var knownWarnings: Set<String> = []
@@ -80,6 +86,16 @@ final class TimelineStore: ObservableObject {
     private let service = TaskService.shared
     private var tileIDs: [String: UUID] = [:]
     private var snoozeSnapshots: [UUID: TaskSnapshot] = [:]
+    /// Tasks that were in "Needs rescheduling" and have since been placed again (yellow tiles).
+    private var rescheduledIDs: Set<UUID> = Set(
+        (UserDefaults.standard.stringArray(forKey: "rescheduledTaskIDs") ?? [])
+            .compactMap(UUID.init(uuidString:))
+    )
+
+    private func markRescheduled(_ id: UUID) {
+        rescheduledIDs.insert(id)
+        UserDefaults.standard.set(rescheduledIDs.map(\.uuidString), forKey: "rescheduledTaskIDs")
+    }
     private let cal = Calendar.current
 
     init() {
@@ -91,6 +107,11 @@ final class TimelineStore: ObservableObject {
         refresh(announceWarnings: false)                          // warnings that already exist at launch stay quiet
     }
 
+    /// True if the capacity warning applies to `day` (same source as the warning banner).
+    func isOverloaded(_ day: Date) -> Bool {
+        backend.overloadedDays.contains { cal.isDate($0.date, inSameDayAs: day) }
+    }
+    
     // MARK: - Rebuild the UI state from the backend
 
     func refresh(announceWarnings: Bool = true) {
@@ -106,6 +127,9 @@ final class TimelineStore: ObservableObject {
         for (taskId, rows) in rowsByTask {
             guard let t = byId[taskId] else { continue }
             let live = rows.filter { !$0.isMissed }.sorted { $0.start < $1.start }
+            // A task that has a missed row AND a live row was re-placed after being missed:
+            // its live tile(s) show as "rescheduled" (yellow). Plain drags of unstarted tiles never match.
+            let everMissed = rows.contains { $0.isMissed }
             let rule = (t.templateId.flatMap { templates[$0]?.repeatRule } ?? t.repeatRule)
             for row in rows.sorted(by: { $0.start < $1.start }) {
                 let day  = cal.startOfDay(for: row.start)
@@ -134,7 +158,8 @@ final class TimelineStore: ObservableObject {
                     taskID: t.id,
                     rowKey: row.id,
                     isMissedRow: row.isMissed || t.status == .missed,
-                    isChunk: isChunk
+                    isChunk: isChunk,
+                    isRescheduled: (everMissed || rescheduledIDs.contains(t.id)) && !row.isMissed
                 ))
             }
         }
@@ -148,14 +173,14 @@ final class TimelineStore: ObservableObject {
             return !hasLiveRow && (t.isUnscheduled || t.status == .blocked)
         }
         .sorted { $0.dateCreated < $1.dateCreated }
-        .map { UnscheduledTask(id: $0.id, title: $0.title, color: color(for: $0), durationMinutes: $0.duration) }
-
+        .map { UnscheduledTask(id: $0.id, title: $0.title, color: color(for: $0), durationMinutes: $0.duration, isSplittable: $0.splittable) }
         // Needs rescheduling: missed fixed tasks and missed repeat instances.
         reschedule = all.filter { $0.status == .missed }.map { t in
             let r = backend.rows(for: t.id).last
             let f = DateFormatter(); f.dateFormat = "HH:mm"
             let when = r.map { "\(f.string(from: $0.start)) – \(f.string(from: $0.end))" } ?? ""
-            return RescheduleTask(id: t.id, title: t.title, scheduledTime: when)
+            return RescheduleTask(id: t.id, title: t.title, scheduledTime: when, durationMinutes: t.duration,
+                                  color: color(for: t))
         }
 
         syncWarnings(announce: announceWarnings)
@@ -195,6 +220,16 @@ final class TimelineStore: ObservableObject {
                   Calendar.current.isDate(t.date, inSameDayAs: date) else { return false }
             return start < t.endHour && end > t.startHour
         }
+    }
+
+    /// A task that can be dragged from the Tasks sheet onto the timeline:
+    /// Unscheduled, or Needs rescheduling.                                  //NEW not in zip.
+    func draggableTask(_ id: UUID) -> UnscheduledTask? {
+        if let u = unscheduled.first(where: { $0.id == id }) { return u }
+        if let r = reschedule.first(where: { $0.id == id }) {
+            return UnscheduledTask(id: r.id, title: r.title, color: r.color, durationMinutes: r.durationMinutes)
+        }
+        return nil
     }
 
     // MARK: - Add
@@ -314,6 +349,7 @@ final class TimelineStore: ObservableObject {
         let target = self.date(on: date, hour: newStart)
         let now = Date()
         let before = snapshot(now)
+        let undo = makeUndo(undoSnapshot(for: id), day: tile.date)
         let ok = service.moveManually(slotId: key, to: target)
         let change = diff(since: before, now: now)
         refresh()
@@ -322,7 +358,7 @@ final class TimelineStore: ObservableObject {
         if ok, let tid = tile.taskID {
             let row = backend.rows(for: tid).first { abs($0.start.timeIntervalSince(target)) < 1 }
             announce(ScheduleAlert.moved(start: target, end: row?.end, now: now),
-                     change.excluding([tid]), adjusted: ScheduleAlert.adjusted)
+                     change.excluding([tid]), adjusted: ScheduleAlert.adjusted, undo: undo)
         }
         return ok
     }
@@ -333,38 +369,69 @@ final class TimelineStore: ObservableObject {
         let target = self.date(on: date, hour: startHour)
         let now = Date()
         let before = snapshot(now)
+        let undo = makeUndo(backend.snapshot(of: [id]), day: nil)
+        let wasMissed = reschedule.contains { $0.id == id }
         let ok = service.place(taskId: id, at: target)
         let change = diff(since: before, now: now)
+        if ok && wasMissed { markRescheduled(id) }
         refresh()
 
         // Alert 4 (+ 7, 14). A refused drop shows nothing.
         if ok {
             announce(ScheduleAlert.placed(at: target, now: now),
-                     change.excluding([id]), adjusted: ScheduleAlert.adjusted)
+                     change.excluding([id]), adjusted: ScheduleAlert.adjusted, undo: undo)
         }
         return ok
     }
 
     /// The task is dropped onto several pieces: the exact segments are pinned.
-    func split(_ id: UUID, into segments: [SlotSegment], on date: Date) {
-        guard let tile = tile(id), let tid = tile.taskID, segments.count > 1 else { return }
-        let day = cal.startOfDay(for: date)
-        let segs = segments.map { s -> (start: Date, end: Date) in
-            (cal.date(byAdding: .minute, value: s.start, to: day) ?? day,
-             cal.date(byAdding: .minute, value: s.end, to: day) ?? day)
-        }
-        let now = Date()
-        let before = snapshot(now)
-        let ok = service.placeSplit(taskId: tid, segments: segs)
-        let change = diff(since: before, now: now)
-        refresh()
+    @discardableResult
+    func split(_ id: UUID, into segments: [SlotSegment], on date: Date) -> Bool {      //NEW not in zip. (now returns success)
+            guard let tile = tile(id), let tid = tile.taskID, segments.count > 1 else { return false }
+            let day = cal.startOfDay(for: date)
+            let segs = segments.map { s -> (start: Date, end: Date) in
+                (cal.date(byAdding: .minute, value: s.start, to: day) ?? day,
+                 cal.date(byAdding: .minute, value: s.end, to: day) ?? day)
+            }
+            let now = Date()
+            let before = snapshot(now)
+            let undo = makeUndo(undoSnapshot(for: id), day: tile.date)      //NEW not in zip.
+            let ok = service.placeSplit(taskId: tid, segments: segs)
+            let change = diff(since: before, now: now)
+            refresh()
 
-        if ok {                                                // Alert 5 (+ 7, 14)
-            announce(ScheduleAlert.movedToSlots(segs.count),
-                     change.excluding([tid]), adjusted: ScheduleAlert.adjusted)
-        }
+            if ok {                                                // Alert 5 (+ 7, 14)
+                announce(ScheduleAlert.movedToSlots(segs.count),
+                         change.excluding([tid]), adjusted: ScheduleAlert.adjusted, undo: undo)
+            }
+            return ok
     }
-
+    
+    /// Split an Unscheduled / Needs-rescheduling task across the chosen slots (pinned).
+    @discardableResult
+    func splitUnscheduled(_ id: UUID, into segments: [SlotSegment], on date: Date) -> Bool {
+            guard segments.count > 1 else { return false }
+            let day = cal.startOfDay(for: date)
+            let segs = segments.map { s -> (start: Date, end: Date) in
+                (cal.date(byAdding: .minute, value: s.start, to: day) ?? day,
+                 cal.date(byAdding: .minute, value: s.end, to: day) ?? day)
+            }
+            let now = Date()
+            let before = snapshot(now)
+            let undo = makeUndo(backend.snapshot(of: [id]), day: nil)     // back to the Unscheduled list
+            let wasMissed = reschedule.contains { $0.id == id }
+            let ok = service.placeSplit(taskId: id, segments: segs)
+            let change = diff(since: before, now: now)
+            if ok && wasMissed { markRescheduled(id) }
+            refresh()
+            if ok {
+                announce(ScheduleAlert.movedToSlots(segs.count),
+                         change.excluding([id]), adjusted: ScheduleAlert.adjusted, undo: undo)
+            }
+            return ok
+    }
+    
+    
     // MARK: - Swipe actions
 
     /// Right swipe on a tile: mark done (or undo if already done). Applies to the whole task.
@@ -412,6 +479,32 @@ final class TimelineStore: ObservableObject {
         refresh()
     }
 
+    // MARK: - Undo a drag                                                  //NEW not in zip.
+
+    /// Task + slots as they are right now. Take it BEFORE a drag commits.
+    func undoSnapshot(for id: UUID) -> TaskSnapshot? {
+        guard let tid = tile(id)?.taskID else { return nil }
+        return backend.snapshot(of: [tid])
+    }
+
+    /// Puts the task and its slots back exactly (same path as undoing a snooze).
+    func restoreSnapshot(_ snap: TaskSnapshot) {
+        service.restore(snap)
+        refresh()
+    }
+
+    /// The Undo button on the "Task moved…" toast.
+    private func makeUndo(_ snap: TaskSnapshot?, day: Date?) -> (() -> Void)? {
+        guard let snap else { return nil }
+        return { [weak self] in
+            guard let self else { return }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            self.dismissToast()
+            if let day { self.focusDate = day }
+            self.restoreSnapshot(snap)
+        }
+    }
+    
     // MARK: - Organize My Day (Alerts 11 and 12)
 
     /// Call this from whatever control starts "Organize My Day". It previews first (Alert 11);
@@ -452,7 +545,8 @@ final class TimelineStore: ObservableObject {
 
     /// One toast per action: the primary message, plus either Alert 14 (a task lost its slot)
     /// or Alert 7 (other tasks moved). Success wording is only used when `primary` is non-nil.
-    private func announce(_ primary: String?, _ change: ScheduleChange, adjusted: String?) {
+    private func announce(_ primary: String?, _ change: ScheduleChange, adjusted: String?,
+                          undo: (() -> Void)? = nil) {
         var parts: [String] = []
         if let primary { parts.append(primary) }
         if !change.lost.isEmpty {
@@ -462,7 +556,8 @@ final class TimelineStore: ObservableObject {
         }
         guard !parts.isEmpty else { return }
         showToast(parts.joined(separator: " "),
-                  icon: primary == nil ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                  icon: primary == nil ? "exclamationmark.circle.fill" : "checkmark.circle.fill",
+                  undo: primary == nil ? nil : undo)
     }
 
     /// Alert 6. Returns true if a dialog was raised (the caller must stop and wait for the answer).
@@ -493,12 +588,12 @@ final class TimelineStore: ObservableObject {
 
     // MARK: Toast
 
-    func showToast(_ text: String, icon: String = "checkmark.circle.fill") {
-        let t = ScheduleToast(text: text, icon: icon)
+    func showToast(_ text: String, icon: String = "checkmark.circle.fill", undo: (() -> Void)? = nil) {
+        let t = ScheduleToast(text: text, icon: icon, undo: undo)
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { toast = t }
         UIAccessibility.post(notification: .announcement, argument: text)
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(4.5))
+            try? await Task.sleep(for: .seconds(undo == nil ? 4.5 : 6))   //NEW not in zip. (a bit longer when Undo is offered)
             guard self?.toast?.id == t.id else { return }          // a newer toast replaced it
             withAnimation(.easeInOut) { self?.toast = nil }
         }

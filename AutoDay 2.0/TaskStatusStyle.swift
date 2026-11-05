@@ -8,8 +8,8 @@
 //  ASSUMPTION: "<Name>_bg" / "Green" = tile fill, "<Name>" = accent (text, bar).
 //
 //  done:        accent = the "Green" asset (text, left bar, tick); fill = a light tint of it.
-//  missed:      fill = "Missed_bg",      accent = "Missed"
-//  rescheduled: fill = "Rescheduled_bg", accent = "Rescheduled"
+//  missed:      accent = "Missed";      fill = a tint of it
+//  rescheduled: accent = "Rescheduled"; fill = a tint of it (yellow: a missed task that was placed again)
 
 import SwiftUI
 import UIKit
@@ -21,7 +21,7 @@ enum TaskStatusStyle {
         switch self {
         case .done:        return TaskStatusStyle.pastel("Green", amount: 0.18)
         case .missed:      return TaskStatusStyle.pastel("Missed", amount: 0.14)   //NEW not in zip.
-        case .rescheduled: return Color("Rescheduled_bg")
+        case .rescheduled: return TaskStatusStyle.pastel("Rescheduled", amount: 0.20)
         }
     }
 

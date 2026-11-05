@@ -20,6 +20,11 @@ extension TimelineView {
             calendar.isDate($0.date, inSameDayAs: selectedDate) || $0.id == draggedTaskId
         }
     }
+    
+    /// Overlap column for each tile on the selected day.
+    var taskLanes: [UUID: TaskLane] {
+        computeTaskLanes(visibleTasks.filter { calendar.isDate($0.date, inSameDayAs: selectedDate) })
+    }
 
     // MARK: - Drag handlers
 
@@ -66,10 +71,11 @@ extension TimelineView {
     /// Pick-up: haptic, floating copy, and the candidate slots for this task.
     private func beginFloating(_ task: TimelineTask, in frame: CGRect) {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        let g = laneGeometry(taskLanes[task.id] ?? TaskLane(), totalWidth: frame.width)
         dragOriginFrame = CGRect(
-            x: frame.minX + Theme.labelWidth + 24,
+            x: frame.minX + g.x,
             y: frame.minY + topOffsetForHour(task.startHour) - scrollBox.currentY,
-            width: frame.width - Theme.labelWidth - 24 - 16,
+            width: g.width,
             height: max(CGFloat(task.durationHours) * Theme.hourHeight - 2, 32)
         )
         dragTranslation = .zero
@@ -126,16 +132,21 @@ extension TimelineView {
             cancelEdgeFlip()
             stopAutoScroll()
             scrollBox.dragging = false
-            withAnimation(.easeOut(duration: 0.15)) { slotPlans = [] }
+            if pendingSplit == nil {
+                withAnimation(.easeOut(duration: 0.15)) { slotPlans = [] }
+            }
         }
 
         // A long press that never turned into a drag: nothing to do.
         guard wasFloating else { return }
 
         // 1. Dropped on the trash.
+        // Glide back to its slot, then ask "Are you sure?"; it only goes if confirmed.   //NEW not in zip.
         if overTrash {
-            deleteTask(task)
-            withAnimation(.easeIn(duration: 0.18)) { floatingTask = nil }
+            if dayChanged { withAnimation(.easeInOut(duration: 0.25)) { selectedDate = task.date } }
+            settleFloatingTile(toStartMinutes: toMinutes(task.startHour)) {
+                deleteTask(task)
+            }
             return
         }
 
@@ -167,14 +178,13 @@ extension TimelineView {
 
         // 4. Split: the tile breaks into its pieces.
         case .split:
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                store.split(task.id, into: placement.segments, on: targetDate)
-                floatingTask = nil
-            }
+            let dropMin = toMinutes(ghostHour ?? task.startHour)
+            let seg = placement.segments.min { abs($0.start - dropMin) < abs($1.start - dropMin) }
+                      ?? placement.segments[0]
+            pendingSplit = PendingSplit(task: task, plan: placement, date: targetDate, originDate: task.date)
+            slotPlans = [placement]                       // keep only the chosen split ghosts on screen
+            settleFloatingTile(toStartMinutes: seg.start) {}
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            }
         }
     }
 
@@ -187,7 +197,7 @@ extension TimelineView {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) {
             completion()
-            if draggedTaskId == nil { floatingTask = nil }
+            if draggedTaskId == nil && pendingSplit == nil { floatingTask = nil }
         }
     }
 
@@ -213,7 +223,7 @@ extension TimelineView {
     }
 
     func floatingTimeText(for task: TimelineTask) -> String {
-        if let plan = activePlacement {
+        if let plan = shownPlacement {
             if plan.kind == .whole, let s = plan.segments.first {
                 return "\(clock(s.start)) – \(clock(s.end))"
             }
@@ -223,10 +233,17 @@ extension TimelineView {
     }
 
     /// Shown at the top of the timeline when the task can't go anywhere on this day.
+    /// Covers both drags of tiles already on the timeline and drags out of the Tasks sheet.
     @ViewBuilder
     var noSlotCapsule: some View {
-        if draggedTaskId != nil, slotPlans.isEmpty, ghostHour != nil, !isOverTrash {
-            Label("No free slot on this day", systemImage: "calendar.badge.exclamationmark")
+        let internalEmpty = draggedTaskId != nil && slotPlans.isEmpty && ghostHour != nil && !isOverTrash
+        let externalEmpty = externalDragTask != nil && externalPlans.isEmpty
+
+        if internalEmpty || externalEmpty {
+            Label(externalEmpty
+                  ? "No free slot today for “\(externalDragTask?.title ?? "task")”"
+                  : "No free slot on this day",
+                  systemImage: "calendar.badge.exclamationmark")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 14)
@@ -239,16 +256,14 @@ extension TimelineView {
 
     // MARK: - Delete / undo
 
-//    func deleteTask(_ task: TimelineTask) {
-//        UINotificationFeedbackGenerator().notificationOccurred(.success)
-//        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-//            if let removed = store.delete(task.id) { undoItem = removed }
-//        }
-//        UIAccessibility.post(notification: .announcement,
-//                             argument: "\(task.title) deleted. Undo available.")
-//    }
-    
+    /// Entry point for every delete: asks "Are you sure?" first.         //NEW not in zip.
     func deleteTask(_ task: TimelineTask) {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        taskPendingDelete = task
+    }
+
+    /// Runs after the alert is confirmed.                                //NEW not in zip.
+    func performDelete(_ task: TimelineTask) {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
             if let removed = store.delete(task.id) {
@@ -258,16 +273,6 @@ extension TimelineView {
         UIAccessibility.post(notification: .announcement,
                              argument: "\(task.title) deleted. Undo available.")
     }
-    
-    //undoLast() has replaced the below func.
-
-//    func undoDelete() {
-//        guard let item = undoItem else { return }
-//        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-//            store.restore(item)
-//            undoItem = nil
-//        }
-//    }
 
     // MARK: Vertical auto-scroll (drag near the top/bottom of the timeline)
 
@@ -338,55 +343,129 @@ extension TimelineView {
 
     // MARK: External drop (bottom sheet → timeline)
 
+    /// Start time (minutes from midnight) for a task dropped from the Tasks sheet at `location`
+    /// (ScrollView coordinates). Centred on the finger, snapped, and kept inside the day window.
+    func externalProposedStart(at location: CGPoint, duration: Int) -> Int {
+        let contentY = location.y + scrollBox.currentY
+        let raw = kTimelineStartMinutes + Int((contentY - Theme.lineInset - 1) / kPPM) - duration / 2
+        return min(max(snappedMinutes(raw), kTimelineStartMinutes), kTimelineEndMinutes - duration)
+    }
+
     /// Handle a drop from the bottom sheet.
     /// `dropLocation` is in the ScrollView's frame; adding the scroll offset gives content coords.
-//    func handleExternalDrop(payload: String, dropLocation: CGPoint) -> Bool {
-//        guard let id = UUID(uuidString: payload),
-//              store.unscheduled.contains(where: { $0.id == id }) else { return false }
-//
-//        // Subtract the same top inset the task blocks use so the drop lands where it looks.
-//        let contentY  = dropLocation.y + scrollBox.y - Theme.lineInset - 1
-//        let rawMins   = Int(contentY / kPPM) + kTimelineStartMinutes
-//        let snapped   = snappedMinutes(rawMins)
-//        let dur       = 60   // default 1 h for freshly-dropped tasks
-//        let clamped   = min(max(snapped, kTimelineStartMinutes), kTimelineEndMinutes - dur)
-//        let startHour = minutesToHours(clamped)
-//        let endHour   = startHour + minutesToHours(dur)
-//
-//        guard !store.overlapsBlocker(start: startHour, end: endHour, on: selectedDate, excluding: UUID()) else { return false }
-//        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-//            store.schedule(unscheduledID: id, startHour: startHour, on: selectedDate)
-//        }
-//        return true
-//    }
-    
     func handleExternalDrop(payload: String, dropLocation: CGPoint) -> Bool {
         endExternalDrag()
         guard let id = UUID(uuidString: payload),
-              let u = store.unscheduled.first(where: { $0.id == id }) else { return false }
+              let u = store.draggableTask(id) else { return false }          //NEW not in zip. (also Needs rescheduling)
 
-        let contentY = dropLocation.y + scrollBox.y - Theme.lineInset - 1
-        let rawMins  = Int(contentY / kPPM) + kTimelineStartMinutes
-        let snapped  = snappedMinutes(rawMins)
-        let dur      = u.durationMinutes   // the task's real length
-        let clamped  = min(max(snapped, kTimelineStartMinutes), kTimelineEndMinutes - dur)
-
-        // Same availability rule as dragging a tile: ask the planner.   //NEW not in zip.
+        let dur   = u.durationMinutes
+        let start = externalProposedStart(at: dropLocation, duration: dur)      //NEW not in zip.
         let probe = TimelineTask(title: u.title,
-                                 startHour: minutesToHours(clamped),
-                                 endHour: minutesToHours(clamped + dur),
+                                 startHour: 9,
+                                 endHour: 9 + Double(u.durationMinutes) / 60,
                                  color: u.color, isPinned: true,
-                                 date: calendar.startOfDay(for: selectedDate))
-        let plans = planner.plans(for: probe, on: selectedDate, among: store.tasks, now: Date())
-        guard let placement = resolvePlacement(plans: plans, proposedStart: clamped, duration: dur),
-              placement.kind == .whole, let seg = placement.segments.first else {
+                                 date: calendar.startOfDay(for: selectedDate),
+                                 isSplittable: u.isSplittable,
+                                 taskID: u.id)                                //NEW not in zip.
+        let plans = planner.plans(for: probe, on: selectedDate,
+                                  among: store.tasks.filter { $0.taskID != u.id }, now: Date())   //NEW not in zip. (own old tile excluded)
+        // Large tolerance: dropping on a busy spot snaps to the nearest free edge instead of failing.
+        guard let placement = resolvePlacement(plans: plans, proposedStart: start,
+                                               duration: dur, tolerance: 24 * 60) else {
             UINotificationFeedbackGenerator().notificationOccurred(.error)
+            store.showToast("No free slot today for “\(u.title)”. It's still in your Tasks list.",
+                            icon: "exclamationmark.circle.fill")
             return false
         }
 
+        // Split: same accept / decline alert as a timeline drag.
+        if placement.kind == .split {
+            pendingSplit = PendingSplit(task: probe, plan: placement,
+                                        date: selectedDate, originDate: selectedDate,
+                                        externalID: u.id)
+            return true
+        }
+
+        guard let seg = placement.segments.first else { return false }
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            store.schedule(unscheduledID: id, startHour: minutesToHours(seg.start), on: selectedDate)
+            _ = store.schedule(unscheduledID: id, startHour: minutesToHours(seg.start), on: selectedDate)
         }
         return true
+    }
+    
+    var shownPlacement: SlotPlan? { activePlacement ?? pendingSplit?.plan }
+
+    func confirmSplit(_ p: PendingSplit) {
+        pendingSplit = nil
+        if let id = p.externalID {
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                _ = store.splitUnscheduled(id, into: p.plan.segments, on: p.date)
+            }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            return
+        }
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+            store.split(p.task.id, into: p.plan.segments, on: p.date)
+            floatingTask = nil
+            slotPlans = []
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+    }
+
+    func cancelSplit(_ p: PendingSplit) {
+        pendingSplit = nil
+        if p.externalID != nil { return }
+        if !calendar.isDate(p.originDate, inSameDayAs: selectedDate) {
+            withAnimation(.easeInOut(duration: 0.25)) { selectedDate = p.originDate }
+        }
+        withAnimation(.easeOut(duration: 0.15)) { slotPlans = [] }
+        settleFloatingTile(toStartMinutes: toMinutes(p.task.startHour)) {}
+    }
+
+    struct PendingSplit {
+        let task: TimelineTask
+        let plan: SlotPlan
+        let date: Date
+        let originDate: Date
+        var externalID: UUID? = nil
+    }
+
+    /// Split cue: dashed connector between the pieces + "1/2" scissors badges.
+    struct SplitHintLayer: View {
+        let tint: Color
+        let plan: SlotPlan?
+
+        var body: some View {
+            if let plan, plan.kind == .split {
+                GeometryReader { geo in
+                    let g = laneGeometry(TaskLane(), totalWidth: geo.size.width)
+                    let segs = plan.segments
+                    ZStack(alignment: .topLeading) {
+                        ForEach(Array(segs.indices.dropLast()), id: \.self) { i in
+                            Path { p in
+                                let x = g.x + 10
+                                p.move(to:    CGPoint(x: x, y: topOffsetForHour(Double(segs[i].end) / 60)))
+                                p.addLine(to: CGPoint(x: x, y: topOffsetForHour(Double(segs[i + 1].start) / 60)))
+                            }
+                            .stroke(tint.opacity(0.7), style: StrokeStyle(lineWidth: 2, dash: [4, 4]))
+                        }
+                        ForEach(segs.indices, id: \.self) { i in
+                            Label("\(i + 1)/\(segs.count)", systemImage: "scissors")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(tint, in: Capsule())
+                                .offset(x: g.x + g.width - 64,
+                                        y: topOffsetForHour(Double(segs[i].start) / 60) + 4)
+                        }
+                    }
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+        }
     }
 }

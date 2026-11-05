@@ -10,6 +10,10 @@ struct ScheduleToast: Identifiable, Equatable {
     let id = UUID()
     let text: String
     var icon: String = "checkmark.circle.fill"
+    var undo: (() -> Void)? = nil
+
+    // A closure can't be compared, so two toasts are equal when they are the same toast.
+    static func == (a: ScheduleToast, b: ScheduleToast) -> Bool { a.id == b.id }
 }
 
 struct ScheduleWarningBanner: Identifiable, Equatable {
@@ -191,30 +195,40 @@ struct ScheduleSnapshot {
 
 extension TimelineView {
 
-    /// Toast above the Tasks sheet. Same glass capsule as the undo toast. Tap to dismiss.
+    /// Toast above the Tasks sheet. Same glass capsule as the undo toast. Tap the text to dismiss.
     @ViewBuilder
     var scheduleToast: some View {
         if let toast = store.toast {
-            Button { store.dismissToast() } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: toast.icon)
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.primary)
-                        .accessibilityHidden(true)
-                    Text(toast.text)
-                        .font(.subheadline)
-                        .multilineTextAlignment(.leading)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
+            HStack(spacing: 10) {
+                Button { store.dismissToast() } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: toast.icon)
+                            .font(.subheadline)
+                            .foregroundStyle(Theme.primary)
+                            .accessibilityHidden(true)
+                        Text(toast.text)
+                            .font(.subheadline)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
-                .frame(minHeight: 48)
-                .modifier(GlassCapsule())
-                .padding(.horizontal, 16)
+                .buttonStyle(.plain)
+
+                if let undo = toast.undo {
+                    Button("Undo") { undo() }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.primary)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
             }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .frame(minHeight: 48)
+            .modifier(GlassCapsule())
+            .padding(.horizontal, 16)
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }

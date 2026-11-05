@@ -81,36 +81,42 @@ struct HourRow: View {
 
 struct RescheduleTaskRow: View {
     let task: RescheduleTask
+    /// Called once when the user lifts the row (Manual mode closes the sheet and shows slots).
+    var onDragStart: (() -> Void)? = nil
+
+    private func beginDrag() -> String {
+        onDragStart?()
+        return task.id.uuidString
+    }
 
     var body: some View {
-        HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(Color(hex: "#E5484D"))
-                .frame(width: 4, height: 50)
+        let accent = TaskStatusStyle.missed.accent
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(task.title)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(Color(hex: "#E5484D"))
-                HStack(spacing: 4) {
-                    Image(systemName: "clock.badge.exclamationmark")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color(hex: "#E5484D").opacity(0.85))
-                    Text(task.scheduledTime)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color(hex: "#E5484D").opacity(0.85))
-                }
+        VStack(alignment: .leading, spacing: 3) {
+            Text(task.title)
+                .font(.system(size: 15, weight: .bold))
+                .lineLimit(2)
+
+            HStack(spacing: 4) {
+                Image(systemName: "clock.badge.exclamationmark")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(task.scheduledTime)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
             }
-            Spacer()
+            .opacity(0.75)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(hex: "#f56469").opacity(0.14),
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color(hex: "#f56469").opacity(0.35), lineWidth: 1)
-        )
+        .foregroundStyle(accent)
+        .padding(.leading, 14)
+        .padding(.trailing, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(TaskStatusStyle.missed.fill)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(accent).frame(width: 4)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .draggable(beginDrag())
     }
 }
 
@@ -128,27 +134,36 @@ struct UnscheduledTaskRow: View {
         return task.id.uuidString
     }
 
+    private var durationText: String {
+        let h = task.durationMinutes / 60, m = task.durationMinutes % 60
+        if h == 0 { return "\(m) min" }
+        return m == 0 ? "\(h) h" : "\(h) h \(m) min"
+    }
+
     var body: some View {
-        HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(task.color.text)
-                .frame(width: 4, height: 40)
-
+        VStack(alignment: .leading, spacing: 3) {
             Text(task.title)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(task.color.text)
+                .font(.system(size: 15, weight: .bold))
+                .lineLimit(2)
 
-            Spacer()
-
-            // Visual drag hint
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 12))
-                .foregroundStyle(task.color.text.opacity(0.5))
+            HStack(spacing: 4) {
+                Image(systemName: "timer")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(durationText)
+                    .font(.system(size: 12))
+            }
+            .opacity(0.75)
         }
-        .padding(.horizontal, 12)
+        .foregroundStyle(task.color.text)
+        .padding(.leading, 14)
+        .padding(.trailing, 12)
         .padding(.vertical, 10)
-        .background(task.color.fill,
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(task.color.fill)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(task.color.text).frame(width: 4)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .draggable(beginDrag())
     }
 }

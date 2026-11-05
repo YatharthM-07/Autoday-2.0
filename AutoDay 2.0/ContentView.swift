@@ -8,8 +8,11 @@
 import SwiftUI
 
 struct ContentView: View {
+    @AppStorage(ProfileKeys.appearance) private var appearance = 0
+
     var body: some View {
         TimelineView()
+            .preferredColorScheme(ProfileDefaults.colorScheme(appearance))
     }
 }
 
